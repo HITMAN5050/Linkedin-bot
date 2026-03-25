@@ -40,6 +40,9 @@ async function initBrowser() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-blink-features=AutomationControlled',
+      // Allow third-party cookies — LinkedIn's share modal needs them
+      '--disable-features=ThirdPartyCookieDeprecation,TrackingProtection3pcd',
+      '--disable-site-isolation-trials',
     ],
   });
 
@@ -262,30 +265,50 @@ async function createPost(page, postData) {
 
   await randomDelay(2, 4);
 
-  // 2. Click "Start a post" — use JS to find element by text content
+  // 2. Click "Start a post" — find the clickable *container*, not just the text
   logger.info('Opening post composer…');
+  await takeScreenshot(page, 'before_start_post');
 
   let composerOpened = false;
 
-  // Strategy 1: Find by text content (most reliable for current LinkedIn UI)
-  const startPostEl = await page.evaluateHandle(() => {
-    // Look for the "Start a post" text trigger
-    const candidates = document.querySelectorAll('button, div[role="button"], span, a');
-    for (const el of candidates) {
-      const text = el.textContent?.trim();
-      if (text === 'Start a post' || text === 'Start a post, Daksh') {
-        return el;
+  // Strategy 1: Find "Start a post" text and click its closest clickable ancestor
+  composerOpened = await page.evaluate(() => {
+    // Walk the DOM to find elements containing "Start a post"
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      { acceptNode: (node) =>
+        node.textContent.trim().startsWith('Start a post')
+          ? NodeFilter.FILTER_ACCEPT
+          : NodeFilter.FILTER_REJECT
       }
+    );
+
+    const textNode = walker.nextNode();
+    if (!textNode) return false;
+
+    // Walk UP from the text node to find the closest interactive element
+    let target = textNode.parentElement;
+    while (target) {
+      const tag = target.tagName.toLowerCase();
+      const role = target.getAttribute('role');
+      if (tag === 'button' || tag === 'a' || role === 'button' ||
+          target.classList.contains('share-box-feed-entry__trigger') ||
+          target.classList.contains('share-box-feed-entry__top-bar') ||
+          target.onclick || target.getAttribute('tabindex') !== null) {
+        target.click();
+        return true;
+      }
+      target = target.parentElement;
     }
-    // Look for the share box container and click its trigger area
-    const shareBox = document.querySelector('.share-box-feed-entry__trigger, .share-box-feed-entry__top-bar, [data-urn] .feed-shared-share-box');
-    return shareBox || null;
+
+    // If no interactive parent found, click the direct parent of the text
+    textNode.parentElement?.click();
+    return true;
   });
 
-  if (startPostEl && startPostEl.asElement()) {
-    await startPostEl.asElement().click();
-    composerOpened = true;
-    logger.info('Clicked "Start a post" via text match');
+  if (composerOpened) {
+    logger.info('Clicked "Start a post" via DOM tree traversal');
   }
 
   // Strategy 2: CSS selectors fallback
@@ -295,7 +318,6 @@ async function createPost(page, postData) {
       '.share-box-feed-entry__trigger',
       'div.share-box-feed-entry__top-bar',
       '[aria-label="Text editor for creating content"]',
-      '.share-creation-state__text-editor',
     ];
     for (const sel of fallbackSelectors) {
       try {
@@ -303,7 +325,7 @@ async function createPost(page, postData) {
         if (el) {
           await el.click();
           composerOpened = true;
-          logger.info(`Clicked start-post via fallback: ${sel}`);
+          logger.info(`Clicked start-post via CSS: ${sel}`);
           break;
         }
       } catch {
@@ -317,12 +339,53 @@ async function createPost(page, postData) {
     throw new Error('Could not find the "Start a post" element on the feed.');
   }
 
-  // Wait for the modal / editor to appear (give it extra time)
+  // Wait for the modal to appear
   await randomDelay(3, 5);
+  await takeScreenshot(page, 'after_start_post_click');
+
+  // Check if modal actually opened by looking for common modal indicators
+  const modalVisible = await page.evaluate(() => {
+    // LinkedIn modals typically have these characteristics
+    const overlay = document.querySelector(
+      '[role="dialog"], .share-box-modal, .artdeco-modal, .share-creation-state, ' +
+      '.artdeco-modal-overlay, .share-box--in-modal'
+    );
+    return !!overlay;
+  });
+
+  if (!modalVisible) {
+    logger.warn('Modal may not have opened. Trying to click "Start a post" area again…');
+    // Try clicking directly at the position where "Start a post" appears
+    // Based on screenshots, it's roughly at (500, 95) in the viewport
+    await page.mouse.click(500, 95);
+    await randomDelay(3, 5);
+    await takeScreenshot(page, 'after_second_click');
+  }
 
   // 3. Find the text editor inside the modal
-  // LinkedIn uses various DOM structures — we try multiple strategies
   logger.info('Looking for text editor in modal…');
+
+  // Dump the modal HTML for debugging
+  const modalHTML = await page.evaluate(() => {
+    const modal = document.querySelector(
+      '[role="dialog"], .artdeco-modal, .share-creation-state, .share-box--in-modal'
+    );
+    if (modal) {
+      // Return a summary of the modal's interactive elements
+      const editables = modal.querySelectorAll('[contenteditable], [role="textbox"], textarea, input[type="text"]');
+      const summary = [];
+      editables.forEach((el, i) => {
+        summary.push(`[${i}] tag=${el.tagName} role=${el.getAttribute('role')} ` +
+          `contenteditable=${el.getAttribute('contenteditable')} ` +
+          `class=${el.className?.substring(0, 80)} ` +
+          `placeholder=${el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || ''}`);
+      });
+      return `Modal found (${modal.tagName}.${modal.className?.substring(0, 60)})\n` +
+        `Editables: ${editables.length}\n${summary.join('\n')}`;
+    }
+    return 'No modal element found in DOM';
+  });
+  logger.info(`DOM inspection: ${modalHTML}`);
 
   let editorEl = null;
 
@@ -335,11 +398,14 @@ async function createPost(page, postData) {
     'div[data-placeholder="What do you want to talk about?"]',
     '.share-creation-state__text-editor div[contenteditable]',
     'div[aria-label="Text editor for creating content"]',
+    '.artdeco-modal div[contenteditable="true"]',
+    '[role="dialog"] div[contenteditable="true"]',
+    '[role="dialog"] [role="textbox"]',
   ];
 
   for (const sel of editorSelectors) {
     try {
-      editorEl = await page.waitForSelector(sel, { visible: true, timeout: 3_000 });
+      editorEl = await page.waitForSelector(sel, { visible: true, timeout: 2_000 });
       if (editorEl) {
         logger.info(`Found editor via CSS: ${sel}`);
         break;
@@ -349,33 +415,64 @@ async function createPost(page, postData) {
     }
   }
 
-  // Strategy B: JS-based — find any contenteditable element inside the modal
+  // Strategy B: JS-based — find contenteditable inside the modal
   if (!editorEl) {
     logger.info('CSS selectors missed — trying JS-based editor search…');
     const handle = await page.evaluateHandle(() => {
-      // Find all contenteditable elements
-      const editables = document.querySelectorAll('[contenteditable="true"]');
+      // Look specifically inside the modal
+      const modal = document.querySelector(
+        '[role="dialog"], .artdeco-modal, .share-creation-state'
+      );
+      const searchRoot = modal || document;
+
+      // Find contenteditable elements
+      const editables = searchRoot.querySelectorAll('[contenteditable="true"]');
       for (const el of editables) {
-        // Must be visible (has dimensions)
         const rect = el.getBoundingClientRect();
-        if (rect.width > 100 && rect.height > 50) {
+        if (rect.width > 50 && rect.height > 20) {
           return el;
         }
       }
-      // Fallback: look for the placeholder text container
-      const allDivs = document.querySelectorAll('div');
-      for (const div of allDivs) {
-        const ph = div.getAttribute('data-placeholder') || div.getAttribute('aria-placeholder') || '';
-        if (ph.toLowerCase().includes('what do you want')) {
-          return div;
+
+      // Try role=textbox
+      const textboxes = searchRoot.querySelectorAll('[role="textbox"]');
+      for (const el of textboxes) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width > 50 && rect.height > 20) {
+          return el;
         }
       }
+
       return null;
     });
 
     if (handle && handle.asElement()) {
       editorEl = handle.asElement();
       logger.info('Found editor via JS search');
+    }
+  }
+
+  // Strategy C: Click in the center of the modal area where the editor should be
+  if (!editorEl) {
+    logger.info('Trying coordinate-based click in modal center…');
+    // Based on the screenshot, the editor area is roughly in the center of the viewport
+    await page.mouse.click(640, 300);
+    await randomDelay(1, 2);
+
+    // After clicking, check if we now have focus on something editable
+    const focusedEl = await page.evaluateHandle(() => {
+      const active = document.activeElement;
+      if (active && (active.getAttribute('contenteditable') === 'true' ||
+          active.getAttribute('role') === 'textbox' ||
+          active.tagName === 'TEXTAREA')) {
+        return active;
+      }
+      return null;
+    });
+
+    if (focusedEl && focusedEl.asElement()) {
+      editorEl = focusedEl.asElement();
+      logger.info('Found editor via coordinate click');
     }
   }
 
