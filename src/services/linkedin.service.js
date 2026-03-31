@@ -139,23 +139,72 @@ async function login(page) {
   // Give the page a moment for JS to render the login form
   await randomDelay(2, 4);
 
-  // ── Locate the username field (multiple selector strategies) ─
+  // ── Locate the username field ──────────────────────────────
+  // LinkedIn has multiple login page variants — try many strategies
+  let usernameField = null;
+
+  // Strategy 1: Classic CSS selectors
   const usernameSelectors = [
     '#username',
     'input[name="session_key"]',
     'input[autocomplete="username"]',
+    'input[autocomplete="email"]',
   ];
 
-  let usernameField = null;
   for (const sel of usernameSelectors) {
     try {
-      usernameField = await page.waitForSelector(sel, { visible: true, timeout: 5_000 });
+      usernameField = await page.waitForSelector(sel, { visible: true, timeout: 3_000 });
       if (usernameField) {
-        logger.info(`Found username field via: ${sel}`);
+        logger.info(`Found username field via CSS: ${sel}`);
         break;
       }
     } catch {
-      // selector not found, try next
+      // try next
+    }
+  }
+
+  // Strategy 2: Find input by label text (new LinkedIn layout)
+  if (!usernameField) {
+    logger.info('Trying label-based input detection…');
+    const handle = await page.evaluateHandle(() => {
+      // Look for visible text inputs on the page
+      const inputs = document.querySelectorAll('input[type="text"], input[type="email"], input:not([type])');
+      for (const input of inputs) {
+        const rect = input.getBoundingClientRect();
+        if (rect.width < 50 || rect.height < 10) continue; // skip hidden
+
+        // Check associated label or nearby text
+        const id = input.id;
+        if (id) {
+          const label = document.querySelector(`label[for="${id}"]`);
+          if (label) {
+            const text = label.textContent.toLowerCase();
+            if (text.includes('email') || text.includes('phone') || text.includes('username')) {
+              return input;
+            }
+          }
+        }
+
+        // Check placeholder
+        const ph = (input.placeholder || '').toLowerCase();
+        if (ph.includes('email') || ph.includes('phone')) return input;
+
+        // Check aria-label
+        const aria = (input.getAttribute('aria-label') || '').toLowerCase();
+        if (aria.includes('email') || aria.includes('phone')) return input;
+      }
+
+      // Last resort: return the first visible text-like input
+      for (const input of inputs) {
+        const rect = input.getBoundingClientRect();
+        if (rect.width > 100 && rect.height > 20) return input;
+      }
+      return null;
+    });
+
+    if (handle && handle.asElement()) {
+      usernameField = handle.asElement();
+      logger.info('Found username field via label/placeholder detection');
     }
   }
 
@@ -182,20 +231,36 @@ async function login(page) {
 
   await randomDelay(0.5, 1.5);
 
-  // Find password field (visible only)
+  // ── Locate the password field ──────────────────────────────
+  let passwordField = null;
+
   const passwordSelectors = [
     '#password',
     'input[name="session_password"]',
     'input[type="password"]',
   ];
 
-  let passwordField = null;
   for (const sel of passwordSelectors) {
     try {
-      passwordField = await page.waitForSelector(sel, { visible: true, timeout: 5_000 });
+      passwordField = await page.waitForSelector(sel, { visible: true, timeout: 3_000 });
       if (passwordField) break;
     } catch {
       // try next
+    }
+  }
+
+  // Fallback: find password by label text
+  if (!passwordField) {
+    const pwHandle = await page.evaluateHandle(() => {
+      const inputs = document.querySelectorAll('input[type="password"]');
+      for (const input of inputs) {
+        const rect = input.getBoundingClientRect();
+        if (rect.width > 50 && rect.height > 10) return input;
+      }
+      return null;
+    });
+    if (pwHandle && pwHandle.asElement()) {
+      passwordField = pwHandle.asElement();
     }
   }
 
@@ -255,6 +320,7 @@ async function login(page) {
  */
 async function createPost(page, postData) {
   // 1. Always navigate to the feed to ensure we're in the right place
+  // Navigate to the feed
   logger.info('Navigating to LinkedIn feed…');
   await safeGoto(page, 'https://www.linkedin.com/feed/', 45_000);
 
@@ -265,142 +331,124 @@ async function createPost(page, postData) {
 
   await randomDelay(2, 4);
 
-  // 2. Click "Start a post" — find the clickable *container*, not just the text
+  // 2. Open the post composer
   logger.info('Opening post composer…');
   await takeScreenshot(page, 'before_start_post');
+  
+  // To deal with LinkedIn's aggressive DOM obfuscation and anti-automation,
+  // we use a highly robust client-side script to find and trigger the "Start a post" element.
+  let modalVisible = false;
 
-  let composerOpened = false;
-
-  // Strategy 1: Find "Start a post" text and click its closest clickable ancestor
-  composerOpened = await page.evaluate(() => {
-    // Walk the DOM to find elements containing "Start a post"
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
-      { acceptNode: (node) =>
-        node.textContent.trim().startsWith('Start a post')
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_REJECT
+  const tryTriggerModal = async () => {
+    return await page.evaluate(() => {
+      // Look for the specific start-post button or top-bar
+      let trigger = document.querySelector('button.share-box-feed-entry__trigger, div.share-box-feed-entry__top-bar, [aria-label*="Start a post"], [aria-label*="create a post"]');
+      
+      if (!trigger) {
+        // Fallback: search all buttons and spans for "Start a post"
+        const elements = Array.from(document.querySelectorAll('button, div[role="button"], span, form'));
+        for (const el of elements) {
+          if (el.innerText && el.innerText.trim().includes('Start a post')) {
+             // If we found a span, we want to click its parent button
+             trigger = el.closest('button') || el.closest('[role="button"]') || el;
+             break;
+          }
+        }
       }
-    );
 
-    const textNode = walker.nextNode();
-    if (!textNode) return false;
-
-    // Walk UP from the text node to find the closest interactive element
-    let target = textNode.parentElement;
-    while (target) {
-      const tag = target.tagName.toLowerCase();
-      const role = target.getAttribute('role');
-      if (tag === 'button' || tag === 'a' || role === 'button' ||
-          target.classList.contains('share-box-feed-entry__trigger') ||
-          target.classList.contains('share-box-feed-entry__top-bar') ||
-          target.onclick || target.getAttribute('tabindex') !== null) {
-        target.click();
+      if (trigger) {
+        // Dispatch multiple types of click events to ensure React catches it
+        trigger.click();
+        trigger.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        trigger.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
         return true;
       }
-      target = target.parentElement;
-    }
+      return false;
+    });
+  };
 
-    // If no interactive parent found, click the direct parent of the text
-    textNode.parentElement?.click();
-    return true;
-  });
-
-  if (composerOpened) {
-    logger.info('Clicked "Start a post" via DOM tree traversal');
+  const triggered = await tryTriggerModal();
+  if (triggered) {
+    logger.info('Dispatched click events to "Start a post" trigger');
+  } else {
+    logger.warn('Could not locate "Start a post" trigger via evaluate');
   }
 
-  // Strategy 2: CSS selectors fallback
-  if (!composerOpened) {
-    const fallbackSelectors = [
-      'button.share-box-feed-entry__trigger',
-      '.share-box-feed-entry__trigger',
-      'div.share-box-feed-entry__top-bar',
-      '[aria-label="Text editor for creating content"]',
-    ];
-    for (const sel of fallbackSelectors) {
-      try {
-        const el = await page.waitForSelector(sel, { visible: true, timeout: 3_000 });
-        if (el) {
-          await el.click();
-          composerOpened = true;
-          logger.info(`Clicked start-post via CSS: ${sel}`);
-          break;
-        }
-      } catch {
-        // try next
-      }
-    }
-  }
-
-  if (!composerOpened) {
-    await takeScreenshot(page, 'start_post_not_found');
-    throw new Error('Could not find the "Start a post" element on the feed.');
-  }
-
-  // Wait for the modal to appear
   await randomDelay(3, 5);
-  await takeScreenshot(page, 'after_start_post_click');
+  await takeScreenshot(page, 'after_first_click');
 
-  // Check if modal actually opened by looking for common modal indicators
-  const modalVisible = await page.evaluate(() => {
-    // LinkedIn modals typically have these characteristics
-    const overlay = document.querySelector(
-      '[role="dialog"], .share-box-modal, .artdeco-modal, .share-creation-state, ' +
-      '.artdeco-modal-overlay, .share-box--in-modal'
-    );
-    return !!overlay;
+  modalVisible = await page.evaluate(() => {
+    return !!document.querySelector('[role="dialog"], .artdeco-modal, .share-box-modal');
   });
 
   if (!modalVisible) {
-    logger.warn('Modal may not have opened. Trying to click "Start a post" area again…');
-    // Try clicking directly at the position where "Start a post" appears
-    // Based on screenshots, it's roughly at (500, 95) in the viewport
-    await page.mouse.click(500, 95);
+    logger.warn('Modal not detected. Trying fallback mouse click…');
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await randomDelay(1, 2);
+    
+    // Try to find the bounding box and click with Puppeteer mouse
+    const box = await page.evaluate(() => {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, { 
+        acceptNode: node => node.textContent.trim().startsWith('Start a post') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT 
+      });
+      const textNode = walker.nextNode();
+      if (!textNode || !textNode.parentElement) return null;
+      let target = textNode.parentElement.closest('button') || textNode.parentElement.closest('[role="button"]');
+      if (!target) {
+        // Find widest parent up to body
+        let best = textNode.parentElement;
+        let w = best.getBoundingClientRect().width;
+        let curr = textNode.parentElement;
+        while(curr && curr !== document.body) {
+           let rw = curr.getBoundingClientRect().width;
+           if(rw > 800) break;
+           if(rw > w && rw >= 200) { best = curr; w = rw; }
+           curr = curr.parentElement;
+        }
+        target = best;
+      }
+      const r = target.getBoundingClientRect();
+      return { x: r.x + r.width/2, y: r.y + r.height/2 };
+    });
+
+    if (box) {
+      await page.mouse.click(box.x, box.y, { delay: 50 });
+      logger.info(`Puppeteer clicked at (${Math.round(box.x)}, ${Math.round(box.y)})`);
+    }
+
     await randomDelay(3, 5);
     await takeScreenshot(page, 'after_second_click');
+    modalVisible = await page.evaluate(() => !!document.querySelector('[role="dialog"], .artdeco-modal'));
   }
 
-  // 3. Find the text editor inside the modal
-  logger.info('Looking for text editor in modal…');
+  // 3. Find the text editor
+  logger.info('Looking for text editor…');
 
-  // Dump the modal HTML for debugging
-  const modalHTML = await page.evaluate(() => {
-    const modal = document.querySelector(
-      '[role="dialog"], .artdeco-modal, .share-creation-state, .share-box--in-modal'
-    );
-    if (modal) {
-      // Return a summary of the modal's interactive elements
-      const editables = modal.querySelectorAll('[contenteditable], [role="textbox"], textarea, input[type="text"]');
-      const summary = [];
-      editables.forEach((el, i) => {
-        summary.push(`[${i}] tag=${el.tagName} role=${el.getAttribute('role')} ` +
-          `contenteditable=${el.getAttribute('contenteditable')} ` +
-          `class=${el.className?.substring(0, 80)} ` +
-          `placeholder=${el.getAttribute('data-placeholder') || el.getAttribute('placeholder') || ''}`);
-      });
-      return `Modal found (${modal.tagName}.${modal.className?.substring(0, 60)})\n` +
-        `Editables: ${editables.length}\n${summary.join('\n')}`;
-    }
-    return 'No modal element found in DOM';
+  // Log what the DOM looks like for debugging
+  const domInfo = await page.evaluate(() => {
+    const modal = document.querySelector('[role="dialog"], .artdeco-modal');
+    const editables = document.querySelectorAll('[contenteditable="true"]');
+    const textboxes = document.querySelectorAll('[role="textbox"]');
+    return `Modal: ${modal ? modal.tagName + '.' + (modal.className || '').substring(0, 50) : 'NONE'} | ` +
+      `contenteditable: ${editables.length} | textbox: ${textboxes.length}`;
   });
-  logger.info(`DOM inspection: ${modalHTML}`);
+  logger.info(`DOM: ${domInfo}`);
 
   let editorEl = null;
 
-  // Strategy A: CSS selectors (try each with a short timeout)
   const editorSelectors = [
-    'div[role="textbox"][contenteditable="true"]',
-    'div.ql-editor[contenteditable="true"]',
+    'div[role="textbox"][contenteditable]',
+    'div.ql-editor[contenteditable]',
     'div.ql-editor',
-    '[contenteditable="true"][role="textbox"]',
-    'div[data-placeholder="What do you want to talk about?"]',
-    '.share-creation-state__text-editor div[contenteditable]',
-    'div[aria-label="Text editor for creating content"]',
-    '.artdeco-modal div[contenteditable="true"]',
-    '[role="dialog"] div[contenteditable="true"]',
+    '[contenteditable][role="textbox"]',
+    '.artdeco-modal div[contenteditable]',
+    '[role="dialog"] div[contenteditable]',
     '[role="dialog"] [role="textbox"]',
+    'div[data-placeholder*="talk about"]',
+    'div[aria-label="Text editor for creating content"]',
+    'div[aria-placeholder]',
+    '.share-creation-state__text-editor .ql-editor'
   ];
 
   for (const sel of editorSelectors) {
@@ -415,73 +463,95 @@ async function createPost(page, postData) {
     }
   }
 
-  // Strategy B: JS-based — find contenteditable inside the modal
+  // Strategy B: JS-based with full Shadow root piercing
   if (!editorEl) {
-    logger.info('CSS selectors missed — trying JS-based editor search…');
+    logger.info('CSS missed — trying Shadow DOM piercing search…');
     const handle = await page.evaluateHandle(() => {
-      // Look specifically inside the modal
-      const modal = document.querySelector(
-        '[role="dialog"], .artdeco-modal, .share-creation-state'
-      );
-      const searchRoot = modal || document;
-
-      // Find contenteditable elements
-      const editables = searchRoot.querySelectorAll('[contenteditable="true"]');
-      for (const el of editables) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 50 && rect.height > 20) {
-          return el;
+      // Find all contenteditable elements across main document and all shadow roots
+      function findAllEditables(root, results = []) {
+        if (root.nodeType === Node.ELEMENT_NODE) {
+          if (
+            (root.hasAttribute('contenteditable') && root.getAttribute('contenteditable') !== 'false') ||
+            root.getAttribute('role') === 'textbox' ||
+            root.tagName === 'TEXTAREA'
+          ) {
+            results.push(root);
+          }
+          if (root.shadowRoot) {
+            findAllEditables(root.shadowRoot, results);
+          }
         }
+        for (const child of root.childNodes) {
+          findAllEditables(child, results);
+        }
+        return results;
       }
 
-      // Try role=textbox
-      const textboxes = searchRoot.querySelectorAll('[role="textbox"]');
-      for (const el of textboxes) {
-        const rect = el.getBoundingClientRect();
-        if (rect.width > 50 && rect.height > 20) {
-          return el;
+      const all = findAllEditables(document.body);
+      
+      // Return the largest visible one
+      let best = null;
+      let bestArea = 0;
+      for (const el of all) {
+        let rect;
+        try {
+          rect = el.getBoundingClientRect();
+        } catch { continue; } // element might be detached
+        
+        const area = rect.width * rect.height;
+        if (area > bestArea && rect.width > 50) {
+          best = el;
+          bestArea = area;
         }
       }
-
-      return null;
+      return best;
     });
 
     if (handle && handle.asElement()) {
       editorEl = handle.asElement();
-      logger.info('Found editor via JS search');
+      logger.info('Found editor via Shadow DOM piercing loop');
     }
   }
 
-  // Strategy C: Click in the center of the modal area where the editor should be
+  // Strategy C: Click where the editor should be in the modal and check focus
   if (!editorEl) {
-    logger.info('Trying coordinate-based click in modal center…');
-    // Based on the screenshot, the editor area is roughly in the center of the viewport
-    await page.mouse.click(640, 300);
+    logger.info('Trying coordinate click in modal area…');
+    // The editor area in the modal is roughly centered at (640, 300)
+    await page.mouse.click(640, 280);
     await randomDelay(1, 2);
 
-    // After clicking, check if we now have focus on something editable
-    const focusedEl = await page.evaluateHandle(() => {
-      const active = document.activeElement;
-      if (active && (active.getAttribute('contenteditable') === 'true' ||
-          active.getAttribute('role') === 'textbox' ||
-          active.tagName === 'TEXTAREA')) {
-        return active;
+    const focusedHandle = await page.evaluateHandle(() => {
+      const el = document.activeElement;
+      if (el && (el.getAttribute('contenteditable') === 'true' ||
+          el.getAttribute('role') === 'textbox' ||
+          el.tagName === 'TEXTAREA')) {
+        return el;
       }
       return null;
     });
 
-    if (focusedEl && focusedEl.asElement()) {
-      editorEl = focusedEl.asElement();
-      logger.info('Found editor via coordinate click');
+    if (focusedHandle && focusedHandle.asElement()) {
+      editorEl = focusedHandle.asElement();
+      logger.info('Found editor via coordinate click + focus check');
     }
   }
 
   if (!editorEl) {
     await takeScreenshot(page, 'editor_not_found');
-    throw new Error('Post editor modal did not appear.');
+    throw new Error('Post editor did not appear.');
   }
 
-  await editorEl.click();
+  // Ensure the editor is focused robustly without triggering Puppeteer visibility errors
+  logger.info('Focusing editor…');
+  try {
+    await editorEl.evaluate(el => {
+       el.focus();
+       // Some React implementations require a click to initialize the editor state
+       el.click();
+    });
+  } catch (err) {
+    logger.warn(`Failed to execute focus/click: ${err.message}`);
+  }
   await randomDelay(0.5, 1);
 
   // 4. Compose the content: Title + Body + Link
@@ -502,23 +572,38 @@ async function createPost(page, postData) {
 
   // 6. Click the Post / Submit button
   logger.info('Submitting post…');
-  const postBtnSelector =
-    'button.share-actions__primary-action, ' +
-    'button[aria-label="Post"], ' +
-    'button:has-text("Post")';
+  
+  // Puppeteer doesn't support playwright's :has-text natively without specific pseudo-selectors.
+  // Using reliable standard selectors + a robust fallback.
+  const postBtnSelector = 'button.share-actions__primary-action, button.share-box-v2__primary-btn, div[role="dialog"] button.artdeco-button--primary';
 
   // Try finding the Post button
   const postBtn = await page.waitForSelector(postBtnSelector, { timeout: 10_000 }).catch(() => null);
 
   if (!postBtn) {
-    // Fallback: find any enabled submit-style button in the share modal
+    // Fallback: finding the Post button more aggressively, even piercing Shadow DOMs
     const fallbackBtn = await page.evaluateHandle(() => {
-      const buttons = [...document.querySelectorAll('button')];
-      return buttons.find(
-        (b) =>
-          b.textContent.trim().toLowerCase() === 'post' &&
-          !b.disabled
-      );
+      function findTargetButton(root) {
+        if (!root) return null;
+        if (root.nodeType === Node.ELEMENT_NODE) {
+          if (root.tagName === 'BUTTON') {
+             const textArea = root.textContent.trim().toLowerCase();
+             if ((textArea === 'post' || textArea === 'next' || textArea === 'publish') && !root.disabled && root.offsetHeight > 0) {
+               return root;
+             }
+          }
+          if (root.shadowRoot) {
+             const found = findTargetButton(root.shadowRoot);
+             if (found) return found;
+          }
+        }
+        for (const child of root.childNodes) {
+          const found = findTargetButton(child);
+          if (found) return found;
+        }
+        return null;
+      }
+      return findTargetButton(document.body);
     });
 
     if (fallbackBtn && fallbackBtn.asElement()) {
