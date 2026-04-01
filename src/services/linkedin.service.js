@@ -594,8 +594,13 @@ async function createPost(page, postData) {
         if (root.nodeType === Node.ELEMENT_NODE) {
           if (root.tagName === 'BUTTON') {
              const textArea = root.textContent.trim().toLowerCase();
-             if ((textArea === 'post' || textArea === 'next' || textArea === 'publish') && !root.disabled && root.offsetHeight > 0) {
-               return root;
+             // Often class indicates primary button, sometimes disabled state is governed by aria-disabled
+             const disabled = root.disabled || root.getAttribute('aria-disabled') === 'true' || root.classList.contains('artdeco-button--disabled');
+             if ((textArea.includes('post') || textArea.includes('next') || textArea.includes('publish')) && !disabled && root.offsetHeight > 0) {
+               // Only return if it's a primary style button or inside the dialog bottom action bar
+               if (root.classList.contains('artdeco-button--primary')) {
+                 return root;
+               }
              }
           }
           if (root.shadowRoot) {

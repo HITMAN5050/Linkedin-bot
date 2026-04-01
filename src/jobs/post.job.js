@@ -83,7 +83,12 @@ async function run() {
 
           // Reload feed before retry
           try {
-            await page.goto('https://www.linkedin.com/feed/', {
+            const { config } = require('../config/env');
+            const isCompany = !!config.linkedin.companyId;
+            const feedUrl = isCompany
+              ? `https://www.linkedin.com/company/${config.linkedin.companyId}/admin/feed/posts/`
+              : 'https://www.linkedin.com/feed/';
+            await page.goto(feedUrl, {
               waitUntil: 'domcontentloaded',
               timeout: 45_000,
             });
