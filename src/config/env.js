@@ -12,6 +12,7 @@ const config = {
   linkedin: {
     email: process.env.LINKEDIN_EMAIL,
     password: process.env.LINKEDIN_PASSWORD,
+    companyId: process.env.COMPANY_ID,
   },
   postTime: process.env.POST_TIME || '10:00',
   headless: process.env.HEADLESS === 'true',

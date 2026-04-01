@@ -319,14 +319,20 @@ async function login(page) {
  * @param {{ title: string, body: string, link: string, imagePath?: string }} postData
  */
 async function createPost(page, postData) {
-  // 1. Always navigate to the feed to ensure we're in the right place
-  // Navigate to the feed
-  logger.info('Navigating to LinkedIn feed…');
-  await safeGoto(page, 'https://www.linkedin.com/feed/', 45_000);
+  // 1. Always navigate to the correct feed to ensure we're in the right place
+  // Navigate to company feed if COMPANY_ID is provided, else personal feed
+  const { config } = require('../config/env');
+  const isCompany = !!config.linkedin.companyId;
+  const feedUrl = isCompany
+    ? `https://www.linkedin.com/company/${config.linkedin.companyId}/admin/feed/posts/`
+    : 'https://www.linkedin.com/feed/';
 
-  if (!page.url().includes('/feed')) {
-    logger.warn(`Not on feed (at ${page.url()}). Retrying…`);
-    await safeGoto(page, 'https://www.linkedin.com/feed/', 45_000);
+  logger.info(`Navigating to LinkedIn feed: ${feedUrl} …`);
+  await safeGoto(page, feedUrl, 45_000);
+
+  if ((isCompany && !page.url().includes(config.linkedin.companyId)) || (!isCompany && !page.url().includes('feed'))) {
+    logger.warn(`Not on expected feed (at ${page.url()}). Retrying…`);
+    await safeGoto(page, feedUrl, 45_000);
   }
 
   await randomDelay(2, 4);
